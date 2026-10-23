@@ -46,7 +46,8 @@ RADAR_HISTORY_HOURS=1 ./.venv/bin/python -m weather_radar   # runs on http://127
 ## Deployment (home server `red8`, over Tailscale)
 
 The service runs in Docker as its own unprivileged user `weather-radar` (uid/gid 10001: no sudo,
-no docker group, no login shell), with a read-only root filesystem, no capabilities, a memory
+no docker group, no login shell; "no login" means its shell is `nologin`, it has no password and no
+SSH keys, so nobody can sign in as it), with a read-only root filesystem, no capabilities, a memory
 limit, and its port published only on the Tailscale address `100.95.20.125`.
 
 1. **Once**, create the user (needs root, so you run it): copy `deploy/create-user.sh` to
@@ -54,6 +55,10 @@ limit, and its port published only on the Tailscale address `100.95.20.125`.
    It writes `/tmp/weather-radar-create-user.out`.
 2. From the PC: `deploy/deploy.sh` (rsync to `/srv/stacks/weather-radar`, then `docker compose up -d --build`).
 3. Check from the PC (Tailscale must be on): `curl http://100.95.20.125:8080/health`.
+
+Operating it (on the server, in `/srv/stacks/weather-radar`): `docker compose logs -f` to watch, `docker compose restart` to restart,
+`docker compose down` to stop. The `./data` folder (stored frames) belongs to the service user and
+is not readable by `r2d8`; deleting it only costs a re-download of the last 6 hours.
 
 ## Data and licence
 

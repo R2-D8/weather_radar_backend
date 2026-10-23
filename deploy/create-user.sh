@@ -19,16 +19,39 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-if id "$NAME" >/dev/null 2>&1; then
-    echo "user $NAME already exists"
+# The group first, with the same numeric id as the user and as the container's user, so files in
+# ./data have one owner on both sides (a plain `useradd --system` picks a different group id).
+if getent group "$NAME" >/dev/null; then
+    current_gid="$(getent group "$NAME" | cut -d: -f3)"
+    if [ "$current_gid" != "$ID" ]; then
+        if getent group "$ID" >/dev/null; then
+            echo "gid $ID is taken by another group: leaving group $NAME at gid $current_gid"
+        else
+            groupmod --gid "$ID" "$NAME"
+            echo "changed the gid of group $NAME from $current_gid to $ID"
+        fi
+    fi
 else
-    # Refuse to reuse the id for something else.
-    if getent passwd "$ID" >/dev/null || getent group "$ID" >/dev/null; then
-        echo "uid or gid $ID is already taken by another account: stopping, nothing changed"
+    if getent group "$ID" >/dev/null; then
+        echo "gid $ID is already taken by another group: stopping, nothing changed"
         exit 1
     fi
-    # System account: no password, no login shell, no home directory, own group only.
-    useradd --system --uid "$ID" --user-group --no-create-home \
+    groupadd --system --gid "$ID" "$NAME"
+    echo "created group $NAME ($ID)"
+fi
+
+if id "$NAME" >/dev/null 2>&1; then
+    echo "user $NAME already exists"
+    # Make sure its primary group is the one above.
+    usermod --gid "$NAME" "$NAME"
+else
+    # Refuse to reuse the id for something else.
+    if getent passwd "$ID" >/dev/null; then
+        echo "uid $ID is already taken by another account: stopping, nothing changed"
+        exit 1
+    fi
+    # System account: no password, no login shell, no home directory.
+    useradd --system --uid "$ID" --gid "$NAME" --no-create-home \
         --home-dir /nonexistent --shell /usr/sbin/nologin "$NAME"
     echo "created user $NAME ($ID)"
 fi
