@@ -172,3 +172,42 @@ async def test_corrupt_frame_is_404_not_a_crash(client: TestClient, tmp_path: Pa
     store._decoded.clear()
     assert (await client.get(f"/tiles/{FRAMES[0]}/classic/{RAINY}.png")).status == 404
     assert not store.has(FRAMES[0])
+
+
+async def test_frames_say_how_to_use_the_tiles(client: TestClient) -> None:
+    body = await (await client.get("/frames")).json()
+    assert body["max_zoom"] == 8
+    assert body["tile_size"] == 256
+
+
+@pytest.mark.parametrize(
+    ("lat", "lon", "covered"),
+    [
+        (41.9, 12.5, True),  # Rome
+        (45.65, 13.78, True),  # Trieste
+        (46.2, 6.14, False),  # Geneva: inside the grid, but DPC has no data there
+        (60.45, 22.27, False),  # Turku: outside the grid
+        (0.0, 0.0, False),
+    ],
+)
+async def test_coverage_at_a_point(
+    client: TestClient, lat: float, lon: float, covered: bool
+) -> None:
+    response = await client.get(f"/coverage?lat={lat}&lon={lon}")
+    assert response.status == 200
+    body = await response.json()
+    assert body["covered"] is covered
+    assert body["frame"] == NEWEST
+
+
+@pytest.mark.parametrize(
+    "query", ["", "?lat=45", "?lat=abc&lon=12", "?lat=95&lon=12", "?lat=45&lon=200"]
+)
+async def test_coverage_rejects_bad_requests(client: TestClient, query: str) -> None:
+    assert (await client.get(f"/coverage{query}")).status == 400
+
+
+async def test_coverage_without_frames_is_503(tmp_path: Path, now: Now) -> None:
+    app = create_app(Settings(data_dir=tmp_path), FrameStore(tmp_path / "empty"), None, clock=now)
+    async with TestClient(TestServer(app)) as c:
+        assert (await c.get("/coverage?lat=45&lon=12")).status == 503

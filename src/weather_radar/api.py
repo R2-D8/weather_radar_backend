@@ -2,6 +2,7 @@
 
 GET /frames                                  frame ids (epoch seconds) and times, oldest first
 GET /tiles/{frame}/{palette}/{z}/{x}/{y}.png a map tile (?size=256 or 512)
+GET /coverage?lat=..&lon=..                  whether the newest frame has data at a point
 GET /palettes                                colour palettes with their legend bands
 GET /health                                  200 when frames are fresh, 503 otherwise
 GET /attribution                             data credit to show in the app
@@ -17,8 +18,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import numpy as np
 from aiohttp import web
 
+from weather_radar import geo
 from weather_radar.config import Settings
 from weather_radar.dpc import FRAME_STEP_SECONDS
 from weather_radar.frames import FrameStore
@@ -71,8 +74,42 @@ async def frames(request: web.Request) -> web.Response:
         {
             "frames": [{"id": i, "time": _iso(i)} for i in ids],
             "step_seconds": FRAME_STEP_SECONDS,
+            # What a client needs to set up a raster layer for these tiles.
+            "max_zoom": state.settings.max_zoom,
+            "tile_size": 256,
         },
         headers={"Cache-Control": "public, max-age=30"},
+    )
+
+
+async def coverage(request: web.Request) -> web.Response:
+    """Whether the newest frame has radar data at a point (dry areas count as covered)."""
+    state = request.app[STATE]
+    try:
+        lat = float(request.query["lat"])
+        lon = float(request.query["lon"])
+    except (KeyError, ValueError):
+        raise web.HTTPBadRequest(text="lat and lon are required numbers") from None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise web.HTTPBadRequest(text="lat or lon out of range")
+    ids = state.store.ids()
+    if not ids:
+        raise web.HTTPServiceUnavailable(text="no frames yet")
+    try:
+        frame = await asyncio.to_thread(state.store.load, ids[-1])
+    except KeyError:
+        raise web.HTTPServiceUnavailable(text="no frames yet") from None
+    cell = geo.lonlat_to_cell(lon, lat)
+    covered = False
+    if cell is not None:
+        row, col = cell
+        grid = frame.level(0)
+        # A 3 x 3 cell neighbourhood, so a point on the very edge of the coverage is not missed.
+        block = grid[max(row - 1, 0) : row + 2, max(col - 1, 0) : col + 2]
+        covered = bool((~np.isnan(block)).any())
+    return web.json_response(
+        {"covered": covered, "frame": ids[-1]},
+        headers={"Cache-Control": "public, max-age=300"},
     )
 
 
@@ -199,6 +236,7 @@ def create_app(
     app.add_routes(
         [
             web.get("/frames", frames),
+            web.get("/coverage", coverage),
             web.get("/palettes", palettes),
             web.get("/attribution", attribution),
             web.get("/health", health),

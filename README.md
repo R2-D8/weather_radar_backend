@@ -11,8 +11,9 @@ app: it is off by default there.
 
 | Request | Answer |
 |---|---|
-| `GET /frames` | `{"frames": [{"id": 1792791900, "time": "2026-10-23T21:45:00Z"}, ...], "step_seconds": 300}`, oldest first |
+| `GET /frames` | `{"frames": [{"id": 1792791900, "time": "2026-10-23T21:45:00Z"}, ...], "step_seconds": 300, "max_zoom": 8, "tile_size": 256}`, oldest first |
 | `GET /tiles/{frame}/{palette}/{z}/{x}/{y}.png` | a map tile; `?size=512` for 512 px tiles. Zoom 0 to 8. |
+| `GET /coverage?lat=..&lon=..` | `{"covered": true}` when the newest frame has radar data at that point (dry areas count as covered), so the app can decide whether this server is useful for a place |
 | `GET /palettes` | colour palettes with their legend bands (rain rate in mm/h) |
 | `GET /health` | status, frame count, newest frame age, ingest status; HTTP 503 when starting or stale |
 | `GET /attribution` | the credit the app must show |

@@ -42,6 +42,24 @@ def _to_radar() -> Transformer:
     return t
 
 
+def _from_lonlat() -> Transformer:
+    t: Transformer | None = getattr(_local, "from_lonlat", None)
+    if t is None:
+        t = Transformer.from_crs("EPSG:4326", RADAR_PROJ, always_xy=True)
+        _local.from_lonlat = t
+    return t
+
+
+def lonlat_to_cell(lon: float, lat: float) -> tuple[int, int] | None:
+    """(row, column) of the 1 km grid cell containing a point, or None if outside the grid."""
+    x, y = _from_lonlat().transform(lon, lat)
+    col = math.floor((x - GRID_ORIGIN_X) / GRID_PIXEL_M)
+    row = math.floor((GRID_ORIGIN_Y - y) / GRID_PIXEL_M)
+    if 0 <= col < GRID_COLS and 0 <= row < GRID_ROWS:
+        return row, col
+    return None
+
+
 def _coverage_bounds() -> tuple[float, float, float, float]:
     """Bounding box (min_x, min_y, max_x, max_y) of the radar grid in Web Mercator metres."""
     back = Transformer.from_crs(RADAR_PROJ, "EPSG:3857", always_xy=True)

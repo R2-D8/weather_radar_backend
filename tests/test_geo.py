@@ -62,3 +62,12 @@ def test_coverage_check() -> None:
     assert geo.tile_overlaps_coverage(8, 137, 91)  # north-east Italy
     assert not geo.tile_overlaps_coverage(8, 150, 50)  # Finland
     assert not geo.tile_overlaps_coverage(8, 60, 100)  # Atlantic
+
+
+def test_lonlat_to_cell() -> None:
+    # The projection centre is 600 km from the left edge and 650 km below the top edge.
+    assert geo.lonlat_to_cell(12.5, 42.0) == (650, 600)
+    assert geo.lonlat_to_cell(24.94, 60.17) is None  # Helsinki, far outside the grid
+    assert geo.lonlat_to_cell(-20.0, 20.0) is None
+    row, col = geo.lonlat_to_cell(12.48, 41.89)  # Rome, a little south-west of the centre
+    assert 650 < row < 670 and 590 < col < 600
