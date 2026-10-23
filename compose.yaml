@@ -1,0 +1,27 @@
+# Deployed to /srv/stacks/weather-radar on the home server (see README.md).
+services:
+  radar:
+    build: .
+    image: weather-radar:local
+    container_name: weather-radar
+    restart: unless-stopped
+    # Only on the Tailscale address, never on all interfaces: Docker publishes ports around ufw.
+    ports:
+      - "100.95.20.125:8080:8080"
+    # A dedicated unprivileged host user (uid/gid 10001, created by deploy/create-user.sh): not in the
+    # sudo or docker groups, no login shell. It owns ./data and nothing else.
+    user: "10001:10001"
+    environment:
+      RADAR_HISTORY_HOURS: "6"
+      RADAR_POLL_SECONDS: "30"
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    pids_limit: 128
