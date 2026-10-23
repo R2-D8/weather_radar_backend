@@ -22,7 +22,8 @@ architecture and Phase 4); read them before changing behaviour.
    interfaces: only on `100.95.20.125`.
 6. **Be polite to DPC.** Polls are timed to when the next frame is due (a few tiny requests per 5 minutes), at most 12 frame downloads per poll.
 7. **Palettes are immutable.** Phones cache tiles for good; new colours need a new palette name.
-8. The user is new to Android but an experienced programmer: explain Android-specific things, not
+8. **Keep the GitHub repo updated.** The repo is public: https://github.com/R2-D8/weather_radar_backend (`origin`, branch `main`). After each finished piece of work run the checks (tests, ruff, mypy), commit with a clear message and `git push`. The user asked for this explicitly, for this repo only. Never commit secrets, tokens or personal data; the Tailscale address `100.95.20.125` is a private address and is fine.
+9. The user is new to Android but an experienced programmer: explain Android-specific things, not
    Python basics.
 
 ## Commands
