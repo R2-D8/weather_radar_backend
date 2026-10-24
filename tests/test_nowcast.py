@@ -56,6 +56,22 @@ def test_a_moving_shower_keeps_moving_the_same_way() -> None:
         assert frame.id == 1_000_000 + lead * 60
 
 
+def test_a_third_frame_averages_the_motion_of_both_steps() -> None:
+    # Still for the first 10 minutes, then 6 down and 8 right: the averaged motion is about half.
+    oldest = textured_shower(600, 500)
+    earlier = oldest.copy()
+    newest = np.roll(np.roll(earlier, 6, axis=0), 8, axis=1)
+    start_row, start_col = centre(newest)
+
+    one_step = nowcast.compute(earlier, newest, newest_id=1).frames[30].level(0)
+    two_steps = nowcast.compute(earlier, newest, newest_id=1, oldest=oldest).frames[30].level(0)
+
+    moved_one = np.subtract(centre(one_step), (start_row, start_col))
+    moved_two = np.subtract(centre(two_steps), (start_row, start_col))
+    assert np.all(moved_two > 0), moved_two
+    assert np.allclose(moved_two, moved_one / 2, rtol=0.25), (moved_one, moved_two)
+
+
 def test_a_still_shower_stays_put() -> None:
     newest = blob(700, 600)
     forecast = nowcast.compute(newest.copy(), newest, newest_id=1)

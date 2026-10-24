@@ -2,7 +2,7 @@
 
 Radar tile server for the weather app. It downloads the Italian Civil Protection (DPC) rain-rate
 radar frames, keeps the last 6 hours, and serves them as small map tiles over HTTP, plus a short
-forecast (up to 30 minutes) made by moving the newest frame along its measured motion
+forecast (up to 30 minutes) made by moving the newest frame along its measured motion (averaged over the last two 10-minute steps)
 (`src/weather_radar/nowcast.py`; why only 30 minutes: see the backtest in the app's plan).
 
 The app that uses it is in `../android/weather`; the plan and decisions are in

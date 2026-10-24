@@ -96,8 +96,15 @@ async def current_nowcast(state: AppState) -> Nowcast | None:
         try:
             before = await asyncio.to_thread(state.store.load, earlier)
             latest = await asyncio.to_thread(state.store.load, newest)
+            # A third frame makes the motion steadier; the forecast works without it too.
+            oldest_id = earlier - MOTION_MINUTES * 60
+            oldest = (
+                (await asyncio.to_thread(state.store.load, oldest_id)).level(0)
+                if oldest_id in ids
+                else None
+            )
             state.nowcast = await asyncio.to_thread(
-                nowcasting.compute, before.level(0), latest.level(0), newest
+                nowcasting.compute, before.level(0), latest.level(0), newest, oldest
             )
         except Exception:
             log.exception("could not compute the forecast for frame %d", newest)

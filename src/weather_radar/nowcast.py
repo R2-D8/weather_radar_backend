@@ -1,10 +1,16 @@
 """A short rain forecast ("nowcast") made by moving the newest frame along its recent motion.
 
 The motion is measured between the newest frame and the one 10 minutes earlier (dense optical
-flow), smoothed and capped, and the newest rain field is then shifted along it. This cannot
+flow), smoothed and capped, and averaged with the motion of the 10 minutes before that when that
+frame is there; the newest rain field is then shifted along it. This cannot
 predict storms that have not formed yet and loses skill quickly: a backtest on DPC data (see the
 plan) showed a clear gain over "the rain stays where it is" up to about 30 minutes, so that is
 as far as it goes.
+
+Averaging two motion estimates was the only change that helped in a second backtest (8 rain events,
+114 start times, October 2026): +0.005 to +0.008 on every score and lead time, better in about
+70 % of cases. Open-Meteo model data (700/850 hPa winds as motion, model rain trend as growth and
+decay, blending in model rain) did not help and was left out; see the app's docs/plan.md.
 """
 
 from __future__ import annotations
@@ -86,9 +92,15 @@ def advect(newest: Grid, motion: np.ndarray, minutes: int) -> Grid:
     return result
 
 
-def compute(earlier: Grid, newest: Grid, newest_id: int) -> Nowcast:
-    """Forecast frames LEAD_MINUTES after [newest_id] (epoch seconds)."""
+def compute(earlier: Grid, newest: Grid, newest_id: int, oldest: Grid | None = None) -> Nowcast:
+    """Forecast frames LEAD_MINUTES after [newest_id] (epoch seconds).
+
+    [earlier] is MOTION_MINUTES before [newest]; [oldest], if given, MOTION_MINUTES before
+    [earlier]. With it, the motion is the average of the two steps, which is steadier.
+    """
     motion = measure_motion(earlier, newest)
+    if oldest is not None:
+        motion = (motion + measure_motion(oldest, earlier)) / 2
     frames = {
         lead: RadarFrame(newest_id + lead * 60, advect(newest, motion, lead))
         for lead in LEAD_MINUTES
