@@ -211,3 +211,44 @@ async def test_coverage_without_frames_is_503(tmp_path: Path, now: Now) -> None:
     app = create_app(Settings(data_dir=tmp_path), FrameStore(tmp_path / "empty"), None, clock=now)
     async with TestClient(TestServer(app)) as c:
         assert (await c.get("/coverage?lat=45&lon=12")).status == 503
+
+
+async def test_frames_list_the_short_forecast(client: TestClient) -> None:
+    body = await (await client.get("/frames")).json()
+    # FRAMES has the newest frame and the one 10 minutes earlier, so a forecast can be made.
+    assert body["forecast_base"] == NEWEST
+    assert [f["lead_minutes"] for f in body["forecast"]] == [10, 20, 30]
+    assert [f["id"] for f in body["forecast"]] == [NEWEST + 600, NEWEST + 1200, NEWEST + 1800]
+
+
+async def test_forecast_tiles(client: TestClient) -> None:
+    await client.get("/frames")
+    response = await client.get(f"/forecast/{NEWEST}/20/classic/{RAINY}.png")
+    assert response.status == 200
+    assert response.headers["Cache-Control"] == IMMUTABLE
+    assert Image.open(io.BytesIO(await response.read())).size == (256, 256)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"/forecast/{NEWEST - 300}/20/classic/8/137/91.png",  # an older base: replaced
+        f"/forecast/{NEWEST}/25/classic/8/137/91.png",  # not a forecast lead time
+        f"/forecast/{NEWEST}/20/neon/8/137/91.png",
+        f"/forecast/{NEWEST}/20/classic/9/1/1.png",
+    ],
+)
+async def test_bad_forecast_requests_are_404(client: TestClient, path: str) -> None:
+    assert (await client.get(path)).status == 404
+
+
+async def test_no_forecast_without_a_frame_ten_minutes_earlier(
+    tmp_path: Path, sample_bytes: bytes, now: Now
+) -> None:
+    store = FrameStore(tmp_path / "one")
+    store.save(NEWEST, sample_bytes)
+    app = create_app(Settings(data_dir=tmp_path), store, None, clock=now)
+    async with TestClient(TestServer(app)) as c:
+        body = await (await c.get("/frames")).json()
+    assert body["forecast"] == []
+    assert body["forecast_base"] is None

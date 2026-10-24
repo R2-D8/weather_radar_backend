@@ -2,6 +2,9 @@
 
 GET /frames                                  frame ids (epoch seconds) and times, oldest first
 GET /tiles/{frame}/{palette}/{z}/{x}/{y}.png a map tile (?size=256 or 512)
+GET /forecast/{base}/{lead}/{palette}/{z}/{x}/{y}.png
+                                             a tile of the short forecast made from frame {base},
+                                             {lead} minutes ahead (listed in /frames as "forecast")
 GET /coverage?lat=..&lon=..                  whether the newest frame has data at a point
 GET /palettes                                colour palettes with their legend bands
 GET /health                                  200 when frames are fresh, 503 otherwise
@@ -12,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import logging
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -22,13 +27,17 @@ import numpy as np
 from aiohttp import web
 
 from weather_radar import geo
+from weather_radar import nowcast as nowcasting
 from weather_radar.config import Settings
 from weather_radar.dpc import FRAME_STEP_SECONDS
 from weather_radar.frames import FrameStore
 from weather_radar.ingest import Ingestor
+from weather_radar.nowcast import MOTION_MINUTES, Nowcast
 from weather_radar.palettes import DEFAULT_PALETTE, PALETTES, Palette
 from weather_radar.render import TILE_SIZES, render_tile
 from weather_radar.tilecache import TileCache
+
+log = logging.getLogger(__name__)
 
 ATTRIBUTION = (
     "Radar data: Radar-DPC, Presidenza del Consiglio dei Ministri - "
@@ -53,6 +62,9 @@ class AppState:
     renders: asyncio.Semaphore
     started: float
     clock: Callable[[], float] = time.time
+    #: The forecast for the newest frame, made on first use after each new frame.
+    nowcast: Nowcast | None = None
+    nowcast_lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
 
 
 STATE = web.AppKey("state", AppState)
@@ -67,9 +79,36 @@ def _hex(rgb_alpha: tuple[int, int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb_alpha[:3])
 
 
+async def current_nowcast(state: AppState) -> Nowcast | None:
+    """The forecast for the newest frame, computing it if needed; None without enough frames."""
+    ids = state.store.ids()
+    if not ids:
+        return None
+    newest = ids[-1]
+    earlier = newest - MOTION_MINUTES * 60
+    if earlier not in ids:
+        return None
+    if state.nowcast is not None and state.nowcast.base_id == newest:
+        return state.nowcast
+    async with state.nowcast_lock:
+        if state.nowcast is not None and state.nowcast.base_id == newest:
+            return state.nowcast
+        try:
+            before = await asyncio.to_thread(state.store.load, earlier)
+            latest = await asyncio.to_thread(state.store.load, newest)
+            state.nowcast = await asyncio.to_thread(
+                nowcasting.compute, before.level(0), latest.level(0), newest
+            )
+        except Exception:
+            log.exception("could not compute the forecast for frame %d", newest)
+            return None
+        return state.nowcast
+
+
 async def frames(request: web.Request) -> web.Response:
     state = request.app[STATE]
     ids = state.store.ids()
+    forecast = await current_nowcast(state)
     return web.json_response(
         {
             "frames": [{"id": i, "time": _iso(i)} for i in ids],
@@ -77,6 +116,14 @@ async def frames(request: web.Request) -> web.Response:
             # What a client needs to set up a raster layer for these tiles.
             "max_zoom": state.settings.max_zoom,
             "tile_size": 256,
+            # Short forecast made from the newest frame; tiles under /forecast/{base}/{lead}/.
+            "forecast_base": None if forecast is None else forecast.base_id,
+            "forecast": []
+            if forecast is None
+            else [
+                {"lead_minutes": lead, "id": frame.id, "time": _iso(frame.id)}
+                for lead, frame in sorted(forecast.frames.items())
+            ],
         },
         headers={"Cache-Control": "public, max-age=30"},
     )
@@ -153,6 +200,7 @@ async def health(request: web.Request) -> web.Response:
         "newest_frame_age_seconds": None if newest_age is None else int(newest_age),
         "uptime_seconds": int(now - state.started),
         "tile_cache": {"tiles": len(state.cache), "bytes": state.cache.size_bytes},
+        "forecast_base": None if state.nowcast is None else _iso(state.nowcast.base_id),
     }
     if state.ingestor is not None:
         s = state.ingestor.status
@@ -173,9 +221,9 @@ def _int(request: web.Request, name: str) -> int:
         raise web.HTTPNotFound from None
 
 
-async def tile(request: web.Request) -> web.Response:
+def _tile_request(request: web.Request) -> tuple[Palette, int, int, int, int]:
+    """Validated (palette, z, x, y, size) of a tile request."""
     state = request.app[STATE]
-    frame_id = _int(request, "frame")
     z, x, y = _int(request, "z"), _int(request, "x"), _int(request, "y")
     palette = PALETTES.get(request.match_info["palette"])
     if palette is None:
@@ -185,7 +233,34 @@ async def tile(request: web.Request) -> web.Response:
     size_text = request.query.get("size", "256")
     if size_text not in {str(s) for s in TILE_SIZES}:
         raise web.HTTPBadRequest(text=f"size must be one of {TILE_SIZES}")
-    size = int(size_text)
+    return palette, z, x, y, int(size_text)
+
+
+async def forecast_tile(request: web.Request) -> web.Response:
+    state = request.app[STATE]
+    base = _int(request, "base")
+    lead = _int(request, "lead")
+    palette, z, x, y, size = _tile_request(request)
+    key = ("forecast", base, lead, palette.name, size, z, x, y)
+    png = state.cache.get(key)
+    if png is None:
+        forecast = await current_nowcast(state)
+        # An older base means the phone has an old frame list; it will ask for the new one.
+        if forecast is None or forecast.base_id != base or lead not in forecast.frames:
+            raise web.HTTPNotFound(text="no such forecast (it may have been replaced)")
+        async with state.renders:
+            png = await asyncio.to_thread(
+                render_tile, forecast.frames[lead], palette, z, x, y, size
+            )
+        state.cache.put(key, png)
+    # A forecast for a given base and lead never changes; a newer forecast has a different base.
+    return web.Response(body=png, content_type="image/png", headers={"Cache-Control": IMMUTABLE})
+
+
+async def tile(request: web.Request) -> web.Response:
+    state = request.app[STATE]
+    frame_id = _int(request, "frame")
+    palette, z, x, y, size = _tile_request(request)
 
     key = (frame_id, palette.name, size, z, x, y)
     png = state.cache.get(key)
@@ -241,6 +316,7 @@ def create_app(
             web.get("/attribution", attribution),
             web.get("/health", health),
             web.get(r"/tiles/{frame}/{palette}/{z}/{x}/{y}.png", tile),
+            web.get(r"/forecast/{base}/{lead}/{palette}/{z}/{x}/{y}.png", forecast_tile),
         ]
     )
     app.cleanup_ctx.append(_ingest_lifecycle)

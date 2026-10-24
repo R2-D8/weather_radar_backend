@@ -8,6 +8,8 @@ dependencies = [
     "numpy>=2.0",
     "pyproj>=3.6",
     "Pillow>=10.4",
+    # Optical flow and image warping for the short rain forecast (headless: no GUI libraries).
+    "opencv-python-headless>=4.10",
 ]
 
 [project.optional-dependencies]

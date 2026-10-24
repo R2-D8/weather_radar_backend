@@ -1,7 +1,9 @@
 # weather-radar
 
 Radar tile server for the weather app. It downloads the Italian Civil Protection (DPC) rain-rate
-radar frames, keeps the last 6 hours, and serves them as small map tiles over HTTP.
+radar frames, keeps the last 6 hours, and serves them as small map tiles over HTTP, plus a short
+forecast (up to 30 minutes) made by moving the newest frame along its measured motion
+(`src/weather_radar/nowcast.py`; why only 30 minutes: see the backtest in the app's plan).
 
 The app that uses it is in `../android/weather`; the plan and decisions are in
 `../android/weather/docs/plan.md` (Radar architecture, Phase 4). The server is optional for the
@@ -13,6 +15,7 @@ app: it is off by default there.
 |---|---|
 | `GET /frames` | `{"frames": [{"id": 1792791900, "time": "2026-10-23T21:45:00Z"}, ...], "step_seconds": 300, "max_zoom": 8, "tile_size": 256}`, oldest first |
 | `GET /tiles/{frame}/{palette}/{z}/{x}/{y}.png` | a map tile; `?size=512` for 512 px tiles. Zoom 0 to 8. |
+| `GET /forecast/{base}/{lead}/{palette}/{z}/{x}/{y}.png` | a tile of the short rain forecast made from frame `{base}`, `{lead}` = 10, 20 or 30 minutes ahead. `/frames` lists them under `forecast` (with `forecast_base`) once two frames 10 minutes apart exist. Immutable per base. |
 | `GET /coverage?lat=..&lon=..` | `{"covered": true}` when the newest frame has radar data at that point (dry areas count as covered), so the app can decide whether this server is useful for a place |
 | `GET /palettes` | colour palettes with their legend bands (rain rate in mm/h) |
 | `GET /health` | status, frame count, newest frame age, ingest status; HTTP 503 when starting or stale |
