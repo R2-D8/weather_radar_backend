@@ -1,46 +1,34 @@
-"""Temperature maps from ICON-EU, corrected for the real ground height.
+"""Temperature maps from ICON-D2 and ICON-EU, corrected for the real ground height.
 
-The store keeps one grid per hour (the 2 m temperature in degrees C as float16, about 1.8 MB) from
-the newest model run that covers that hour, from [past] hours ago to [future] hours ahead. Past
-hours therefore come from the first hours of recent runs, which are close to the observed weather.
+The 2 m temperature of each hour comes from ICON-D2 (2 km) where it has data, faded into ICON-EU
+(7 km) towards the edge of its area, and from ICON-EU alone elsewhere and beyond D2's +48 h (see
+`modeldata`). Grids are stored in degrees C as float16.
 
 **Height correction.** On a 7 km grid the model's ground is smoothed: an Alpine valley floor may
 sit 900 m lower than the model thinks, and air there is several degrees warmer. Each pixel is
 corrected with a standard lapse rate: T = T_model + 6.5 K/km * (model ground - real ground). This is
 what most point forecasts do too; it can be wrong under winter inversions (cold air pooled in
-valleys), where the valley is colder than the correction says.
+valleys), where the valley is colder than the correction says. ICON-D2's finer ground makes the
+correction smaller, and it resolves some of the cold pools itself.
 """
 
 from __future__ import annotations
 
-import asyncio
 import io
-import logging
 import math
-import re
-import time
-from collections import OrderedDict
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import timedelta
 from functools import lru_cache
-from pathlib import Path
-from typing import cast
 
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
-from weather_radar import icon
-from weather_radar.icon import IconClient, IconError
+from weather_radar.icon import ICON_D2, ICON_EU, Model
+from weather_radar.modeldata import Grid, blend, sample
 from weather_radar.terrain import TILE_SIZE, Heights
-
-log = logging.getLogger(__name__)
 
 LAPSE_RATE_K_PER_M = 0.0065
 HOUR = 3600
-
-_FILE = re.compile(r"^(\d+)_(\d+)\.npy$")
 
 
 @dataclass(frozen=True)
@@ -129,25 +117,6 @@ def tile_lonlat(
     return lat_grid, lon_grid
 
 
-def sample(
-    grid: NDArray[np.floating], lat: NDArray[np.float64], lon: NDArray[np.float64]
-) -> NDArray[np.float32]:
-    """Bilinear sample of an ICON-EU grid at points; NaN outside the model area."""
-    row = (lat - icon.GRID_LAT0) / icon.GRID_STEP
-    col = (lon - icon.GRID_LON0) / icon.GRID_STEP
-    inside = (row >= 0) & (row <= icon.GRID_ROWS - 1) & (col >= 0) & (col <= icon.GRID_COLS - 1)
-    r0 = np.clip(np.floor(row).astype(np.int64), 0, icon.GRID_ROWS - 2)
-    c0 = np.clip(np.floor(col).astype(np.int64), 0, icon.GRID_COLS - 2)
-    fr = np.clip(row - r0, 0.0, 1.0)
-    fc = np.clip(col - c0, 0.0, 1.0)
-    v00 = grid[r0, c0].astype(np.float64)
-    v01 = grid[r0, c0 + 1].astype(np.float64)
-    v10 = grid[r0 + 1, c0].astype(np.float64)
-    v11 = grid[r0 + 1, c0 + 1].astype(np.float64)
-    value = (v00 * (1 - fc) + v01 * fc) * (1 - fr) + (v10 * (1 - fc) + v11 * fc) * fr
-    return np.where(inside, value, np.nan).astype(np.float32)
-
-
 def corrected(
     t_model: NDArray[np.float32], model_ground: NDArray[np.float32], ground: NDArray[np.float32]
 ) -> NDArray[np.float32]:
@@ -159,15 +128,94 @@ def corrected(
     return result
 
 
+@dataclass(frozen=True)
+class ModelHour:
+    """One hour's grids: ICON-EU always, ICON-D2 where it has the hour (with its fade weight)."""
+
+    eu: NDArray[np.floating]
+    eu_ground: NDArray[np.floating]
+    d2: NDArray[np.floating] | None = None
+    d2_ground: NDArray[np.floating] | None = None
+    d2_weight: NDArray[np.floating] | None = None
+
+
+#: Height matching on the ICON-D2 grid: cells within this many cells count...
+MATCH_RADIUS = 3
+#: ...weighted by distance (Gaussian, in cells)...
+MATCH_SIGMA = 1.5
+#: ...and by how close their ground is to the real one (falls to 1/e per this many metres).
+MATCH_HEIGHT_M = 100.0
+
+
+def height_matched(
+    grid: NDArray[np.floating],
+    model_ground: NDArray[np.floating],
+    lat: NDArray[np.float64],
+    lon: NDArray[np.float64],
+    ground: Heights,
+    model: Model = ICON_D2,
+) -> Grid:
+    """Temperature at points from the nearby model cells whose ground is closest to the real one.
+
+    Each cell's value is first moved to the real height with the standard lapse rate, then the
+    cells are averaged with weights that favour nearby cells and, strongly, cells at about the
+    same height. In a 2 km grid an Alpine valley floor usually has a cell of its own, and on a calm
+    night that cell holds the cold air the model pooled there; plain interpolation would mix in
+    the slopes above and then warm the result by 6.5 K/km, which is what made valleys too warm.
+    Checked against Open-Meteo's ICON-D2 values for seven Alpine and Po valley points on
+    2026-11-02 20 UTC: mean error 0.3 C, against 0.5 C for interpolation (Sondrio 8.9 C instead
+    of 10.2 C, reference 8.3 C).
+    """
+    real = np.maximum(ground, 0.0).astype(np.float64)
+    row = (lat - model.lat0) / model.step
+    col = (lon - model.lon0) / model.step
+    r0 = np.floor(row).astype(np.int64)
+    c0 = np.floor(col).astype(np.int64)
+    total = np.zeros(lat.shape, dtype=np.float64)
+    weights = np.zeros(lat.shape, dtype=np.float64)
+    for dr in range(-MATCH_RADIUS + 1, MATCH_RADIUS + 1):
+        rr = r0 + dr
+        for dc in range(-MATCH_RADIUS + 1, MATCH_RADIUS + 1):
+            cc = c0 + dc
+            inside = (rr >= 0) & (rr < model.rows) & (cc >= 0) & (cc < model.cols)
+            ri = np.clip(rr, 0, model.rows - 1)
+            ci = np.clip(cc, 0, model.cols - 1)
+            t = grid[ri, ci].astype(np.float64)
+            z = model_ground[ri, ci].astype(np.float64)
+            ok = inside & ~np.isnan(t) & ~np.isnan(z)
+            distance2 = (rr - row) ** 2 + (cc - col) ** 2
+            w = np.exp(-distance2 / (2 * MATCH_SIGMA**2) - np.abs(z - real) / MATCH_HEIGHT_M)
+            w = np.where(ok, w, 0.0)
+            total += w * np.where(ok, t + LAPSE_RATE_K_PER_M * (z - real), 0.0)
+            weights += w
+    # Far from every cell's height (deep below a ridge) the weights underflow: plain lapse rate.
+    fallback = corrected(
+        sample(grid, lat, lon, model), sample(model_ground, lat, lon, model), ground
+    )
+    matched = total / np.maximum(weights, 1e-300)
+    return np.where(weights > 1e-12, matched, fallback).astype(np.float32)
+
+
+def temperature_at(
+    hour: ModelHour, lat: NDArray[np.float64], lon: NDArray[np.float64], ground: Heights
+) -> Grid:
+    """Height-corrected temperature at points; NaN outside ICON-EU's area."""
+    t = corrected(sample(hour.eu, lat, lon), sample(hour.eu_ground, lat, lon), ground)
+    if hour.d2 is None or hour.d2_ground is None or hour.d2_weight is None:
+        return t
+    t_d2 = height_matched(hour.d2, hour.d2_ground, lat, lon, ground)
+    return blend(t, t_d2, sample(hour.d2_weight, lat, lon, ICON_D2))
+
+
 def tile_overlaps_model(z: int, x: int, y: int) -> bool:
+    """Whether tile z/x/y touches ICON-EU's area (ICON-D2's lies inside it)."""
     n = 2**z
     west = x / n * 360.0 - 180.0
     east = (x + 1) / n * 360.0 - 180.0
     north = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
     south = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
-    lat1 = icon.GRID_LAT0 + (icon.GRID_ROWS - 1) * icon.GRID_STEP
-    lon1 = icon.GRID_LON0 + (icon.GRID_COLS - 1) * icon.GRID_STEP
-    return not (east < icon.GRID_LON0 or west > lon1 or north < icon.GRID_LAT0 or south > lat1)
+    m = ICON_EU
+    return not (east < m.lon0 or west > m.lon1 or north < m.lat0 or south > m.lat1)
 
 
 @lru_cache(maxsize=1)
@@ -180,18 +228,11 @@ def empty_tile() -> bytes:
 
 
 def render_tile(
-    grid: NDArray[np.floating],
-    model_ground: NDArray[np.floating],
-    ground: Heights,
-    palette: TemperaturePalette,
-    z: int,
-    x: int,
-    y: int,
+    hour: ModelHour, ground: Heights, palette: TemperaturePalette, z: int, x: int, y: int
 ) -> bytes:
     """An 8-bit palette PNG of the height-corrected temperature over tile z/x/y."""
     lat, lon = tile_lonlat(z, x, y)
-    t = corrected(sample(grid, lat, lon), sample(model_ground, lat, lon), ground)
-    index = palette.bands(t)
+    index = palette.bands(temperature_at(hour, lat, lon, ground))
     if not index.any():
         return empty_tile()
     rgb, alpha = palette.png_palette()
@@ -202,249 +243,8 @@ def render_tile(
     return buffer.getvalue()
 
 
-def point_value(
-    grid: NDArray[np.floating],
-    model_ground: NDArray[np.floating],
-    lat: float,
-    lon: float,
-    ground: float,
-) -> float | None:
+def point_value(hour: ModelHour, lat: float, lon: float, ground: float) -> float | None:
     """Height-corrected temperature at a point, or None outside the model area."""
-    la = np.array([lat])
-    lo = np.array([lon])
-    here = np.array([ground], np.float32)
-    t = corrected(sample(grid, la, lo), sample(model_ground, la, lo), here)
+    t = temperature_at(hour, np.array([lat]), np.array([lon]), np.array([ground], np.float32))
     value = float(t[0])
     return None if math.isnan(value) else value
-
-
-# --- storage ----------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Hour:
-    #: Valid time and model run start, both epoch seconds.
-    valid: int
-    run: int
-
-
-class TemperatureStore:
-    """Files `{valid}_{run}.npy` (float16 degrees C) and `model_ground.npy` (float32 metres)."""
-
-    def __init__(self, directory: Path, open_grids: int = 6) -> None:
-        self._dir = directory
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._open: OrderedDict[Hour, NDArray[np.float16]] = OrderedDict()
-        self._open_max = open_grids
-        self._ground: NDArray[np.float32] | None = None
-
-    @property
-    def ground_path(self) -> Path:
-        return self._dir / "model_ground.npy"
-
-    def hours(self) -> list[Hour]:
-        """Stored hours, oldest first (one per valid time: the newest run)."""
-        best: dict[int, int] = {}
-        for path in self._dir.iterdir():
-            m = _FILE.match(path.name)
-            if m:
-                valid, run = int(m.group(1)), int(m.group(2))
-                if run > best.get(valid, -1):
-                    best[valid] = run
-        return [Hour(v, best[v]) for v in sorted(best)]
-
-    def has_ground(self) -> bool:
-        return self.ground_path.exists()
-
-    def save_ground(self, heights: NDArray[np.float32]) -> None:
-        _save_atomically(self.ground_path, heights.astype(np.float32))
-        self._ground = None
-
-    def model_ground(self) -> NDArray[np.float32]:
-        if self._ground is None:
-            self._ground = cast(NDArray[np.float32], np.load(self.ground_path, mmap_mode="r"))
-        return self._ground
-
-    def save(self, hour: Hour, celsius: NDArray[np.float32]) -> None:
-        _save_atomically(self._dir / f"{hour.valid}_{hour.run}.npy", celsius.astype(np.float16))
-        # Older runs for the same hour are no longer needed.
-        for path in self._dir.glob(f"{hour.valid}_*.npy"):
-            m = _FILE.match(path.name)
-            if m and int(m.group(2)) < hour.run:
-                path.unlink(missing_ok=True)
-
-    def load(self, hour: Hour) -> NDArray[np.float16]:
-        grid = self._open.get(hour)
-        if grid is not None:
-            self._open.move_to_end(hour)
-            return grid
-        path = self._dir / f"{hour.valid}_{hour.run}.npy"
-        try:
-            # Memory-mapped: a tile only reads the few pages of the grid it covers.
-            grid = cast(NDArray[np.float16], np.load(path, mmap_mode="r"))
-        except FileNotFoundError:
-            raise KeyError(hour) from None
-        self._open[hour] = grid
-        while len(self._open) > self._open_max:
-            self._open.popitem(last=False)
-        return grid
-
-    def prune(self, oldest_valid: int) -> int:
-        removed = 0
-        for path in self._dir.iterdir():
-            m = _FILE.match(path.name)
-            if m and int(m.group(1)) < oldest_valid:
-                path.unlink(missing_ok=True)
-                self._open = OrderedDict(
-                    (h, g) for h, g in self._open.items() if h.valid >= oldest_valid
-                )
-                removed += 1
-        return removed
-
-
-def _save_atomically(path: Path, array: NDArray[np.generic]) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("wb") as f:
-        np.save(f, array)
-    tmp.replace(path)
-
-
-# --- ingest -----------------------------------------------------------------------------------
-
-
-@dataclass
-class TemperatureStatus:
-    last_success: float | None = None
-    last_error: str | None = None
-    downloaded_total: int = 0
-    newest_run: int | None = None
-
-
-#: Runs looked at: the newest four 6-hourly runs cover the past day, which is all DWD still has.
-RUNS_CONSIDERED = 4
-#: At most this many files per cycle, with a short pause between them, to be polite to DWD.
-MAX_DOWNLOADS_PER_CYCLE = 60
-DOWNLOAD_PAUSE_SECONDS = 0.5
-#: A run is used until it is up to this old (the next one appears about 8.5 h after its
-#: predecessor started), so each run is read this much further ahead than the window needs.
-RUN_AGE_MARGIN = timedelta(hours=12)
-#: ICON-EU is hourly up to +78 h (3-hourly after that, which this code does not handle).
-MAX_HOURLY_STEP = 78
-
-
-def max_step(future: timedelta) -> int:
-    """The furthest forecast hour read from a run, so the window always reaches [future]."""
-    return min(int((future + RUN_AGE_MARGIN).total_seconds()) // HOUR, MAX_HOURLY_STEP)
-
-
-def plan_downloads(
-    now: float,
-    available_runs: list[int],
-    stored: dict[int, int],
-    past: timedelta,
-    future: timedelta,
-) -> list[Hour]:
-    """Which (valid hour, run) files to fetch so every hour in the window has its newest run.
-
-    The window runs from [past] before to [future] after the current hour. [available_runs] are
-    complete runs on DWD's server; [stored] maps valid hour -> stored run. An hour uses the
-    newest run that started at or before it and reaches it (see [max_step]). Newest hours first,
-    so the forecast is complete soonest after a new run.
-    """
-    if not available_runs:
-        return []
-    this_hour = int(now) // HOUR * HOUR
-    first = this_hour - int(past.total_seconds())
-    last = this_hour + int(future.total_seconds())
-    reach = max_step(future) * HOUR
-    wanted: list[Hour] = []
-    for valid in range(last, first - 1, -HOUR):
-        candidates = [r for r in available_runs if r <= valid <= r + reach]
-        if not candidates:
-            continue
-        best = max(candidates)
-        if stored.get(valid, -1) < best:
-            wanted.append(Hour(valid, best))
-    return wanted
-
-
-class TemperatureIngestor:
-    """Keeps the store filled from DWD: checks for new runs every [poll_seconds]."""
-
-    def __init__(
-        self,
-        client: IconClient,
-        store: TemperatureStore,
-        past: timedelta,
-        future: timedelta,
-        poll_seconds: float = 600.0,
-        clock: Callable[[], float] = time.time,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    ) -> None:
-        self._client = client
-        self._store = store
-        self._past = past
-        self._future = future
-        self._poll = poll_seconds
-        self._clock = clock
-        self._sleep = sleep
-        #: Runs known to be complete (they never change once complete).
-        self._complete: set[int] = set()
-        self.status = TemperatureStatus()
-
-    async def run(self) -> None:
-        while True:
-            try:
-                await self.cycle()
-                self.status.last_success = self._clock()
-                self.status.last_error = None
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # keep the loop alive whatever happens
-                log.warning("temperature update failed: %s", e)
-                self.status.last_error = str(e)
-            await self._sleep(self._poll)
-
-    async def available_runs(self) -> list[int]:
-        """Complete runs among the newest few: their last needed hour is on the server."""
-        last_step = max_step(self._future)
-        runs = []
-        for run in icon.latest_run_ids(self._clock(), RUNS_CONSIDERED + 1):
-            if run in self._complete or await self._client.exists(
-                self._client.t2m_url(run, last_step)
-            ):
-                self._complete.add(run)
-                runs.append(run)
-        self._complete &= set(runs)
-        return sorted(runs, reverse=True)[:RUNS_CONSIDERED]
-
-    async def cycle(self) -> int:
-        """One update; returns the number of hours downloaded."""
-        runs = await self.available_runs()
-        if not runs:
-            return 0
-        self.status.newest_run = runs[0]
-        if not self._store.has_ground():
-            data = await self._client.download(self._client.hsurf_url(runs[0]))
-            if data is None:
-                raise IconError("model ground height file missing")
-            self._store.save_ground(await asyncio.to_thread(icon.decode, data))
-        stored = {h.valid: h.run for h in self._store.hours()}
-        todo = plan_downloads(self._clock(), runs, stored, self._past, self._future)
-        done = 0
-        for hour in todo[:MAX_DOWNLOADS_PER_CYCLE]:
-            step = (hour.valid - hour.run) // HOUR
-            data = await self._client.download(self._client.t2m_url(hour.run, step))
-            if data is None:
-                log.info("run %d step %d not on the server, skipping", hour.run, step)
-                continue
-            kelvin = await asyncio.to_thread(icon.decode, data)
-            await asyncio.to_thread(self._store.save, hour, kelvin - np.float32(273.15))
-            done += 1
-            self.status.downloaded_total += 1
-            await self._sleep(DOWNLOAD_PAUSE_SECONDS)
-        oldest = int(self._clock()) // HOUR * HOUR - int(self._past.total_seconds())
-        self._store.prune(oldest)
-        if done:
-            log.info("temperature: %d hours updated (newest run %s)", done, icon.run_time(runs[0]))
-        return done

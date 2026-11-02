@@ -13,18 +13,15 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from PIL import Image
 
-from weather_radar import icon
+from weather_radar import icon, modeldata
 from weather_radar import temperature as temp
-from weather_radar.api import TEMPERATURE, TemperatureFeature, create_app
+from weather_radar.__main__ import to_celsius
+from weather_radar.api import MODELS, ModelFeature, create_app
 from weather_radar.config import Settings
 from weather_radar.frames import FrameStore
-from weather_radar.temperature import (
-    TEMP_2C,
-    Hour,
-    TemperatureIngestor,
-    TemperatureStore,
-    plan_downloads,
-)
+from weather_radar.icon import ICON_EU
+from weather_radar.modeldata import FieldJob, Hour, HourlyStore, ModelIngestor, plan_downloads
+from weather_radar.temperature import TEMP_2C, ModelHour
 from weather_radar.terrain import Terrain, TerrainError, point_pixel
 
 H = 3600
@@ -124,7 +121,8 @@ def test_plan_fills_the_whole_window_from_the_newest_covering_run() -> None:
     # The window starts 24 h before the current hour (RUN + 9 h).
     assert min(by_valid) == RUN - 15 * H
     assert plan[0].valid == RUN + 57 * H  # newest first
-    assert temp.max_step(timedelta(hours=48)) == 60 and temp.max_step(timedelta(hours=90)) == 78
+    assert modeldata.max_step(timedelta(hours=48)) == 60
+    assert modeldata.max_step(timedelta(hours=90)) == 78
 
 
 def test_plan_skips_hours_already_stored_from_the_same_or_a_newer_run() -> None:
@@ -171,19 +169,19 @@ def test_sample_is_nan_outside_the_model_area() -> None:
     grid = field(5.0)
     lat = np.array([45.0, 20.0, 45.0])
     lon = np.array([10.0, 10.0, 70.0])
-    assert np.isnan(temp.sample(grid, lat, lon)).tolist() == [False, True, True]
+    assert np.isnan(modeldata.sample(grid, lat, lon)).tolist() == [False, True, True]
 
 
 def test_render_tile_uses_the_ground_height() -> None:
     z, (x, y) = 8, tile_of(46.2, 9.9, 8)
     flat = np.full((256, 256), 650.0, np.float32)
-    png = temp.render_tile(field(10.0), field(0.0) + 650.0, flat, TEMP_2C, z, x, y)
+    png = temp.render_tile(ModelHour(field(10.0), field(0.0) + 650.0), flat, TEMP_2C, z, x, y)
     image = Image.open(io.BytesIO(png))
     assert image.mode == "P"
     # Model and real ground agree: 10 C, band 20 -> palette index 21.
     assert set(np.asarray(image).ravel().tolist()) == {21}
     valley = np.full((256, 256), 0.0, np.float32)
-    png = temp.render_tile(field(10.0), field(0.0) + 650.0, valley, TEMP_2C, z, x, y)
+    png = temp.render_tile(ModelHour(field(10.0), field(0.0) + 650.0), valley, TEMP_2C, z, x, y)
     # 650 m lower: 14.2 C, band 22 -> index 23.
     assert set(np.asarray(Image.open(io.BytesIO(png))).ravel().tolist()) == {23}
 
@@ -198,7 +196,7 @@ def test_tiles_outside_the_model_area() -> None:
 
 
 def test_store_keeps_only_the_newest_run_per_hour(tmp_path: Path) -> None:
-    store = TemperatureStore(tmp_path)
+    store = HourlyStore(tmp_path)
     store.save(Hour(RUN + H, RUN - 6 * H), field(1.0))
     store.save(Hour(RUN + H, RUN), field(2.0))
     store.save(Hour(RUN + 2 * H, RUN), field(3.0))
@@ -263,20 +261,26 @@ class FakeIcon:
         self.kelvin = grib_bytes(field(283.15))
         self.ground = grib_bytes(field(100.0))
 
-    def t2m_url(self, run_id: int, step: int) -> str:
-        return f"t2m/{run_id}/{step}"
+    def field_url(self, model: icon.Model, name: str, run_id: int, step: int) -> str:
+        return f"{model.name}/{name}/{run_id}/{step}"
 
-    def hsurf_url(self, run_id: int) -> str:
-        return f"hsurf/{run_id}"
+    def hsurf_url(self, model: icon.Model, run_id: int) -> str:
+        return f"{model.name}/hsurf/{run_id}/0"
 
     async def exists(self, url: str) -> bool:
-        return int(url.split("/")[1]) in self.runs
+        return int(url.split("/")[2]) in self.runs
 
     async def download(self, url: str) -> bytes | None:
         self.downloads.append(url)
-        if url.startswith("hsurf/"):
+        _, name, run, step = url.split("/")
+        if name == "hsurf":
             return self.ground
-        return self.kelvin if int(url.split("/")[1]) in self.runs else None
+        if int(run) not in self.runs:
+            return None
+        if name == "tot_prec":
+            # 1.5 mm in every hour: the sum from the run start grows by 1.5 a step.
+            return grib_bytes(field(1.5 * int(step)))
+        return self.kelvin
 
 
 async def _no_sleep(_: float) -> None:
@@ -285,12 +289,19 @@ async def _no_sleep(_: float) -> None:
 
 async def test_ingest_fills_the_store_and_converts_to_celsius(tmp_path: Path) -> None:
     fake = FakeIcon({RUN, RUN - 6 * H})
-    store = TemperatureStore(tmp_path)
-    ingestor = TemperatureIngestor(
-        fake,  # type: ignore[arg-type]
+    store = HourlyStore(tmp_path)
+    job = FieldJob(
+        ICON_EU,
+        "t_2m",
         store,
         past=timedelta(hours=5),
         future=timedelta(hours=4),
+        needs_ground=True,
+        convert=to_celsius,
+    )
+    ingestor = ModelIngestor(
+        fake,  # type: ignore[arg-type]
+        [job],
         clock=lambda: RUN + 3 * H,
         sleep=_no_sleep,
     )
@@ -304,7 +315,7 @@ async def test_ingest_fills_the_store_and_converts_to_celsius(tmp_path: Path) ->
     assert store.has_ground()
     # A second cycle has nothing left to do.
     assert await ingestor.cycle() == 0
-    assert ingestor.status.newest_run == RUN
+    assert ingestor.status[job.name].newest_run == RUN
 
 
 # --- API --------------------------------------------------------------------------------------
@@ -314,7 +325,7 @@ ROME = (41.9, 12.5)
 
 @pytest.fixture
 async def api(tmp_path: Path) -> AsyncIterator[TestClient[web.Request, web.Application]]:
-    store = TemperatureStore(tmp_path / "temperature")
+    store = HourlyStore(tmp_path / "temperature")
     store.save_ground(field(500.0))
     store.save(Hour(RUN + H, RUN), field(12.0))
     # Terrain on disk only (no network): 175 m everywhere around Rome.
@@ -324,10 +335,10 @@ async def api(tmp_path: Path) -> AsyncIterator[TestClient[web.Request, web.Appli
         path = terrain_dir / str(z) / str(tx) / f"{ty}.png"
         path.parent.mkdir(parents=True)
         path.write_bytes(terrarium_png(175.0))
-    feature = TemperatureFeature(store=store, terrain=Terrain(None, terrain_dir), ingestor=None)
+    feature = ModelFeature(terrain=Terrain(None, terrain_dir), t2m_eu=store)
     settings = Settings(data_dir=tmp_path)
-    app = create_app(settings, FrameStore(tmp_path / "frames"), None, temperature=feature)
-    assert app[TEMPERATURE] is feature
+    app = create_app(settings, FrameStore(tmp_path / "frames"), None, models=feature)
+    assert app[MODELS] is feature
     async with TestServer(app) as server, TestClient(server) as client:
         yield client
 
@@ -338,7 +349,9 @@ async def test_temperature_hours_lists_runs_and_legend(
     response = await api.get("/temperature")
     assert response.status == 200
     body = await response.json()
-    assert body["hours"] == [{"id": RUN + H, "time": "2026-11-02T01:00:00Z", "run": RUN}]
+    assert body["hours"] == [
+        {"id": RUN + H, "time": "2026-11-02T01:00:00Z", "run": RUN, "version": str(RUN)}
+    ]
     assert body["palette"] == "temp2c" and len(body["bands"]) == 38
     assert body["bands"][0]["from"] == -30.0 and body["tile_size"] == 256
     assert "Deutscher Wetterdienst" in body["attribution"]

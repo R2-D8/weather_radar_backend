@@ -1,4 +1,4 @@
-"""Turning a radar frame into a map tile (a small palette PNG)."""
+"""Turning a radar frame or a model rain field into a map tile (a small palette PNG)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from PIL import Image
 
 from weather_radar import geo
 from weather_radar.frames import Grid, RadarFrame
-from weather_radar.palettes import Palette
+from weather_radar.palettes import Palette, phased
 
 TILE_SIZES = (256, 512)
 
@@ -61,23 +61,52 @@ def empty_tile(size: int) -> bytes:
     return buffer.getvalue()
 
 
+def encode(rain: Grid, palette: Palette, phase: NDArray[np.uint8] | None = None) -> bytes:
+    """PNG bytes for a square field of rates in mm/h (NaN = no data); no rain gives the empty tile.
+
+    Without [phase] everything is drawn as rain in a 4-bit image. With it (0 rain, 1 mixed,
+    2 snow per pixel) each phase uses its own colour scale in an 8-bit image.
+    """
+    size = rain.shape[0]
+    values = np.nan_to_num(rain, nan=-1.0)
+    if phase is None:
+        thresholds = np.asarray(palette.thresholds, dtype=np.float32)
+        # Band 0 means "below the first threshold or no data"; band i+1 starts at thresholds[i].
+        bands = np.searchsorted(thresholds, values, side="right")
+        if not bands.any():
+            return empty_tile(size)
+        rgb, alpha = palette.png_palette()
+        bits = 4
+    else:
+        rgb, alpha, scales = phased(palette)
+        bands = np.zeros(rain.shape, dtype=np.int64)
+        offset = 0
+        for p, bounds in enumerate(scales):
+            here = np.searchsorted(np.asarray(bounds, dtype=np.float32), values, side="right")
+            bands = np.where((phase == p) & (here > 0), here + offset, bands)
+            offset += len(bounds)
+        if not bands.any():
+            return empty_tile(size)
+        bits = 8
+    image = Image.frombytes("P", (size, size), bands.astype(np.uint8).tobytes())
+    image.putpalette(rgb)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True, transparency=alpha, bits=bits)
+    return buffer.getvalue()
+
+
 def render_tile(
-    frame: RadarFrame, palette: Palette, z: int, x: int, y: int, size: int = 256
+    frame: RadarFrame,
+    palette: Palette,
+    z: int,
+    x: int,
+    y: int,
+    size: int = 256,
+    phase: NDArray[np.uint8] | None = None,
 ) -> bytes:
     """PNG bytes of the tile; no rain, or outside the coverage, gives the shared empty tile."""
     if size not in TILE_SIZES:
         raise ValueError(f"tile size must be one of {TILE_SIZES}")
     if not geo.tile_overlaps_coverage(z, x, y):
         return empty_tile(size)
-    rain = sample_tile(frame, z, x, y, size)
-    thresholds = np.asarray(palette.thresholds, dtype=np.float32)
-    # Band 0 means "below the first threshold or no data"; band i+1 starts at thresholds[i].
-    bands = np.searchsorted(thresholds, np.nan_to_num(rain, nan=-1.0), side="right")
-    if not bands.any():
-        return empty_tile(size)
-    rgb, alpha = palette.png_palette()
-    image = Image.frombytes("P", (size, size), bands.astype(np.uint8).tobytes())
-    image.putpalette(rgb)
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True, transparency=alpha, bits=4)
-    return buffer.getvalue()
+    return encode(sample_tile(frame, z, x, y, size), palette, phase)
