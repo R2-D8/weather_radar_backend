@@ -53,11 +53,11 @@ new palette name.
 | `RADAR_TILE_CACHE_MIB` | `32` | memory for rendered tiles |
 | `RADAR_MAX_ZOOM` | `8` | highest zoom served (the DPC grid is 1 km, about zoom 8) |
 | `RADAR_TEMPERATURE` | `1` | `0` switches the temperature maps off (no DWD or terrain downloads) |
-| `RADAR_TEMPERATURE_PAST_HOURS` / `_FUTURE_HOURS` | `24` / `48` | the hours kept around the current one; about 220 MB a day of downloads with the defaults |
+| `RADAR_TEMPERATURE_PAST_HOURS` / `_FUTURE_HOURS` | `24` / `48` | the hours kept around the current one; about 240 MB a day of downloads with the defaults |
 | `RADAR_TEMPERATURE_POLL_SECONDS` | `600` | how often to look for new model runs (all model fields) |
-| `RADAR_ICON_D2` | `1` | `0`: ICON-EU only (saves about 295 MB a day of downloads) |
-| `RADAR_MODEL_RAIN_HOURS` | `12` | hours of model rain after the radar; `0` switches it off (saves about 145 MB a day) |
-| `RADAR_SNOW` | `1` | `0`: no rain/snow colours, no snow line downloads (saves about 65 MB a day) |
+| `RADAR_ICON_D2` | `1` | `0`: ICON-EU only (saves about 365 MB a day of downloads) |
+| `RADAR_MODEL_RAIN_HOURS` | `12` | hours of model rain after the radar; `0` switches it off (saves about 215 MB a day) |
+| `RADAR_SNOW` | `1` | `0`: no rain/snow colours, no snow line downloads (saves about 90 MB a day) |
 
 ## Development
 
@@ -103,5 +103,8 @@ grid per hour, about 135 MB), `./data/icon-d2/t_2m` (about 130 MB), `./data/icon
 `./data/terrain` (terrain tiles, kept for good, only areas that were viewed).
 
 Downloads with the defaults, per day: DPC radar about 150 MB, ICON-EU temperature about 220 MB,
-ICON-D2 temperature about 185 MB, ICON-D2 rain about 110 MB, ICON-EU snow line about 65 MB,
-ICON-EU rain about 35 MB: about 765 MB in total.
+ICON-D2 temperature about 200 MB, ICON-D2 rain about 165 MB, ICON-EU snow line about 90 MB,
+ICON-EU rain about 50 MB: about 900 MB in total. Most of it comes in four bursts a day, about 3 h
+after the 00, 06, 12 and 18 UTC model runs start (about 155 MB each, over about 35 minutes, files
+one at a time), plus about 6 MB an hour as the windows move on. Rain needs two files for each new
+hour (DWD sums from the run start).

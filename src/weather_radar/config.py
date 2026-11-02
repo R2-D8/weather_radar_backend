@@ -24,7 +24,7 @@ class Settings:
     tile_cache_mib: int = 32
     #: Highest zoom served. The DPC grid is 1 km, about zoom 8; the app overzooms beyond.
     max_zoom: int = 8
-    #: Temperature maps from DWD ICON-EU (downloads about 220 MB a day, more with ICON-D2).
+    #: Temperature maps from DWD ICON-EU (downloads about 240 MB a day, more with ICON-D2).
     temperature: bool = True
     temperature_past: timedelta = timedelta(hours=24)
     temperature_future: timedelta = timedelta(hours=48)
