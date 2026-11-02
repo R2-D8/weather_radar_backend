@@ -4,6 +4,9 @@ Radar tile server for the weather app. It downloads the Italian Civil Protection
 radar frames, keeps the last 6 hours, and serves them as small map tiles over HTTP, plus a short
 forecast (up to 30 minutes) made by moving the newest frame along its measured motion (averaged over the last two 10-minute steps)
 (`src/weather_radar/nowcast.py`; why only 30 minutes: see the backtest in the app's plan).
+It also serves **hourly temperature maps** from DWD's ICON-EU model (24 h back, 48 h ahead),
+corrected for the real ground height with open terrain tiles (`icon.py`, `temperature.py`,
+`terrain.py`; design and measurements in the app's plan, Phase 5c).
 
 The app that uses it is in `../android/weather`; the plan and decisions are in
 `../android/weather/docs/plan.md` (Radar architecture, Phase 4). The server is optional for the
@@ -17,6 +20,9 @@ app: it is off by default there.
 | `GET /tiles/{frame}/{palette}/{z}/{x}/{y}.png` | a map tile; `?size=512` for 512 px tiles. Zoom 0 to 8. |
 | `GET /forecast/{base}/{lead}/{palette}/{z}/{x}/{y}.png` | a tile of the short rain forecast made from frame `{base}`, `{lead}` = 10, 20 or 30 minutes ahead. `/frames` lists them under `forecast` (with `forecast_base`) once two frames 10 minutes apart exist. Immutable per base. |
 | `GET /coverage?lat=..&lon=..` | `{"covered": true}` when the newest frame has radar data at that point (dry areas count as covered), so the app can decide whether this server is useful for a place |
+| `GET /temperature` | hourly temperature maps: `{"hours": [{"id": 1793656800, "time": "...", "run": 1793620800}, ...], "now": ..., "max_zoom": 8, "tile_size": 256, "palette": "temp2c", "unit": "°C", "bands": [{"from": -30.0, "color": "#..."}, ...], "attribution": "..."}`, oldest first |
+| `GET /temperature/{run}/{valid}/{palette}/{z}/{x}/{y}.png` | a 256 px temperature tile of hour `{valid}` from model run `{run}`, 2 °C colour bands, height-corrected. Immutable (a newer run has new URLs). 503 if the terrain tile it needs cannot be fetched. |
+| `GET /temperature/point?lat=..&lon=..&valid=..` | `{"temperature": 7.8, "valid": ..., "run": ..., "ground_m": 133}` at a point (`null` outside the model area) |
 | `GET /palettes` | colour palettes with their legend bands (rain rate in mm/h) |
 | `GET /health` | status, frame count, newest frame age, ingest status; HTTP 503 when starting or stale |
 | `GET /attribution` | the credit the app must show |
@@ -36,6 +42,9 @@ new palette name.
 | `RADAR_POLL_SECONDS` | `30` | how often to re-check while a new frame is overdue; otherwise polls are timed to when DPC publishes the next frame (about 1 to 3 tiny requests per 5 minutes) |
 | `RADAR_TILE_CACHE_MIB` | `32` | memory for rendered tiles |
 | `RADAR_MAX_ZOOM` | `8` | highest zoom served (the DPC grid is 1 km, about zoom 8) |
+| `RADAR_TEMPERATURE` | `1` | `0` switches the temperature maps off (no DWD or terrain downloads) |
+| `RADAR_TEMPERATURE_PAST_HOURS` / `_FUTURE_HOURS` | `24` / `48` | the hours kept around the current one; about 220 MB a day of downloads with the defaults |
+| `RADAR_TEMPERATURE_POLL_SECONDS` | `600` | how often to look for a new model run |
 
 ## Development
 
@@ -68,3 +77,11 @@ is not readable by `r2d8`; deleting it only costs a re-download of the last 6 ho
 
 Radar data: Radar-DPC, Presidenza del Consiglio dei Ministri, Dipartimento della Protezione Civile,
 CC BY-SA 4.0. Keep the credit (`/attribution`) visible in the app.
+
+Temperature: Deutscher Wetterdienst (DWD), ICON-EU, CC BY 4.0 (open data server,
+https://opendata.dwd.de). Ground height: Mapzen/Tilezen Terrain Tiles on AWS (SRTM, GMTED2010,
+ETOPO1, EU-DEM and others; attribution list:
+https://github.com/tilezen/joerd/blob/master/docs/attribution.md). Both credits are in the app.
+
+Stored data: `./data/frames` (radar, 6 h), `./data/temperature` (one float16 grid per hour, about
+135 MB), `./data/terrain` (terrain tiles, kept for good, only areas that were viewed).

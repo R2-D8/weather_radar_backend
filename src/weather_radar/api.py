@@ -6,6 +6,12 @@ GET /forecast/{base}/{lead}/{palette}/{z}/{x}/{y}.png
                                              a tile of the short forecast made from frame {base},
                                              {lead} minutes ahead (listed in /frames as "forecast")
 GET /coverage?lat=..&lon=..                  whether the newest frame has data at a point
+GET /temperature                             hourly temperature maps (ICON-EU, height-corrected):
+                                             hours with their model run, palette and legend
+GET /temperature/{run}/{valid}/{palette}/{z}/{x}/{y}.png
+                                             a temperature tile (256 px)
+GET /temperature/point?lat=..&lon=..&valid=..
+                                             the temperature at a point for one hour
 GET /palettes                                colour palettes with their legend bands
 GET /health                                  200 when frames are fresh, 503 otherwise
 GET /attribution                             data credit to show in the app
@@ -28,6 +34,7 @@ from aiohttp import web
 
 from weather_radar import geo
 from weather_radar import nowcast as nowcasting
+from weather_radar import temperature as temp
 from weather_radar.config import Settings
 from weather_radar.dpc import FRAME_STEP_SECONDS
 from weather_radar.frames import FrameStore
@@ -35,6 +42,16 @@ from weather_radar.ingest import Ingestor
 from weather_radar.nowcast import MOTION_MINUTES, Nowcast
 from weather_radar.palettes import DEFAULT_PALETTE, PALETTES, Palette
 from weather_radar.render import TILE_SIZES, render_tile
+from weather_radar.temperature import (
+    DEFAULT_TEMPERATURE_PALETTE,
+    TEMPERATURE_PALETTES,
+    Hour,
+    TemperatureIngestor,
+    TemperatureStore,
+)
+from weather_radar.terrain import ATTRIBUTION as TERRAIN_ATTRIBUTION
+from weather_radar.terrain import TILE_SIZE as TERRAIN_TILE_SIZE
+from weather_radar.terrain import Terrain, TerrainError
 from weather_radar.tilecache import TileCache
 
 log = logging.getLogger(__name__)
@@ -42,6 +59,10 @@ log = logging.getLogger(__name__)
 ATTRIBUTION = (
     "Radar data: Radar-DPC, Presidenza del Consiglio dei Ministri - "
     "Dipartimento della Protezione Civile (CC BY-SA 4.0)"
+)
+TEMPERATURE_ATTRIBUTION = (
+    "Temperature: Deutscher Wetterdienst, ICON-EU model (CC BY 4.0), corrected for ground height. "
+    + TERRAIN_ATTRIBUTION
 )
 #: Frames older than this make /health report "stale".
 STALE_AFTER_SECONDS = 30 * 60
@@ -67,7 +88,17 @@ class AppState:
     nowcast_lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
 
 
+@dataclass
+class TemperatureFeature:
+    """The optional temperature maps; None in AppState when switched off."""
+
+    store: TemperatureStore
+    terrain: Terrain
+    ingestor: TemperatureIngestor | None
+
+
 STATE = web.AppKey("state", AppState)
+TEMPERATURE = web.AppKey("temperature", TemperatureFeature)
 INGEST_TASK = web.AppKey("ingest_task", asyncio.Task[None])
 
 
@@ -218,6 +249,22 @@ async def health(request: web.Request) -> web.Response:
             "last_error": s.last_error,
             "downloaded_total": s.downloaded_total,
         }
+    feature = request.app.get(TEMPERATURE)
+    if feature is not None:
+        hours = feature.store.hours()
+        t: dict[str, Any] = {
+            "hours": len(hours),
+            "first": None if not hours else _iso(hours[0].valid),
+            "last": None if not hours else _iso(hours[-1].valid),
+            "terrain_tiles_fetched": feature.terrain.fetched_total,
+        }
+        if feature.ingestor is not None:
+            ts = feature.ingestor.status
+            t["newest_run"] = None if ts.newest_run is None else _iso(ts.newest_run)
+            t["last_error"] = ts.last_error
+            t["downloaded_total"] = ts.downloaded_total
+        # Reported only: the radar's health does not depend on the temperature maps.
+        body["temperature"] = t
     return web.json_response(body, status=200 if status == "ok" else 503)
 
 
@@ -289,11 +336,119 @@ async def tile(request: web.Request) -> web.Response:
     )
 
 
+def _temperature(request: web.Request) -> TemperatureFeature:
+    feature = request.app.get(TEMPERATURE)
+    if feature is None:
+        raise web.HTTPNotFound(text="temperature maps are switched off on this server")
+    return feature
+
+
+async def temperature_hours(request: web.Request) -> web.Response:
+    feature = _temperature(request)
+    state = request.app[STATE]
+    hours = feature.store.hours() if feature.store.has_ground() else []
+    palette = TEMPERATURE_PALETTES[DEFAULT_TEMPERATURE_PALETTE]
+    return web.json_response(
+        {
+            "hours": [{"id": h.valid, "time": _iso(h.valid), "run": h.run} for h in hours],
+            "now": int(state.clock()) // temp.HOUR * temp.HOUR,
+            "max_zoom": state.settings.max_zoom,
+            "tile_size": TERRAIN_TILE_SIZE,
+            "palette": palette.name,
+            "unit": "°C",
+            "bands": [
+                {"from": palette.band_start(i), "color": _hex((*c, 255))}
+                for i, c in enumerate(palette.band_colours())
+            ],
+            "attribution": TEMPERATURE_ATTRIBUTION,
+        },
+        headers={"Cache-Control": "public, max-age=60"},
+    )
+
+
+async def temperature_tile(request: web.Request) -> web.Response:
+    feature = _temperature(request)
+    state = request.app[STATE]
+    hour = Hour(valid=_int(request, "valid"), run=_int(request, "run"))
+    z, x, y = _int(request, "z"), _int(request, "x"), _int(request, "y")
+    palette = TEMPERATURE_PALETTES.get(request.match_info["palette"])
+    if palette is None:
+        raise web.HTTPNotFound(text="unknown palette")
+    if not 0 <= z <= state.settings.max_zoom or not (0 <= x < 2**z and 0 <= y < 2**z):
+        raise web.HTTPNotFound(text="tile outside the served range")
+    key = ("temperature", hour.valid, hour.run, palette.name, z, x, y)
+    png = state.cache.get(key)
+    if png is None:
+        try:
+            grid = await asyncio.to_thread(feature.store.load, hour)
+        except KeyError:
+            # Usually a newer model run replaced this hour: the phone will ask for the new list.
+            raise web.HTTPNotFound(text="no such hour (it may have been replaced)") from None
+        if not temp.tile_overlaps_model(z, x, y):
+            png = temp.empty_tile()
+        else:
+            try:
+                ground = await feature.terrain.heights(z, x, y)
+            except TerrainError as e:
+                # Not cached by anyone: a tile without the height correction would be kept for good.
+                log.warning("terrain unavailable: %s", e)
+                raise web.HTTPServiceUnavailable(text="terrain unavailable, retry later") from e
+            async with state.renders:
+                png = await asyncio.to_thread(
+                    temp.render_tile,
+                    grid,
+                    feature.store.model_ground(),
+                    ground,
+                    palette,
+                    z,
+                    x,
+                    y,
+                )
+        state.cache.put(key, png)
+    # One run's map of one hour never changes; a newer run has a different address.
+    return web.Response(body=png, content_type="image/png", headers={"Cache-Control": IMMUTABLE})
+
+
+async def temperature_point(request: web.Request) -> web.Response:
+    feature = _temperature(request)
+    try:
+        lat = float(request.query["lat"])
+        lon = float(request.query["lon"])
+        valid = int(request.query["valid"])
+    except (KeyError, ValueError):
+        raise web.HTTPBadRequest(text="lat, lon and valid are required numbers") from None
+    if not (-85 <= lat <= 85 and -180 <= lon <= 180):
+        raise web.HTTPBadRequest(text="lat or lon out of range")
+    hour = next((h for h in feature.store.hours() if h.valid == valid), None)
+    if hour is None:
+        raise web.HTTPNotFound(text="no such hour")
+    try:
+        grid = await asyncio.to_thread(feature.store.load, hour)
+        ground = await feature.terrain.height_at(lat, lon)
+    except KeyError:
+        raise web.HTTPNotFound(text="no such hour") from None
+    except TerrainError as e:
+        raise web.HTTPServiceUnavailable(text="terrain data unavailable, retry later") from e
+    value = temp.point_value(grid, feature.store.model_ground(), lat, lon, ground)
+    return web.json_response(
+        {
+            "temperature": None if value is None else round(value, 1),
+            "valid": hour.valid,
+            "run": hour.run,
+            "ground_m": round(max(ground, 0.0)),
+        },
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
 async def _ingest_lifecycle(app: web.Application) -> AsyncIterator[None]:
     ingestor = app[STATE].ingestor
-    task = asyncio.create_task(ingestor.run()) if ingestor is not None else None
+    feature = app.get(TEMPERATURE)
+    tasks = [asyncio.create_task(ingestor.run())] if ingestor is not None else []
+    if feature is not None and feature.ingestor is not None:
+        tasks.append(asyncio.create_task(feature.ingestor.run()))
     yield
-    if task is not None:
+    for task in tasks:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -304,6 +459,7 @@ def create_app(
     store: FrameStore,
     ingestor: Ingestor | None,
     clock: Callable[[], float] = time.time,
+    temperature: TemperatureFeature | None = None,
 ) -> web.Application:
     app = web.Application()
     app[STATE] = AppState(
@@ -324,7 +480,12 @@ def create_app(
             web.get("/health", health),
             web.get(r"/tiles/{frame}/{palette}/{z}/{x}/{y}.png", tile),
             web.get(r"/forecast/{base}/{lead}/{palette}/{z}/{x}/{y}.png", forecast_tile),
+            web.get("/temperature", temperature_hours),
+            web.get("/temperature/point", temperature_point),
+            web.get(r"/temperature/{run}/{valid}/{palette}/{z}/{x}/{y}.png", temperature_tile),
         ]
     )
+    if temperature is not None:
+        app[TEMPERATURE] = temperature
     app.cleanup_ctx.append(_ingest_lifecycle)
     return app

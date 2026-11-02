@@ -6,11 +6,14 @@ import logging
 
 from aiohttp import web
 
-from weather_radar.api import create_app
+from weather_radar.api import TemperatureFeature, create_app
 from weather_radar.config import Settings
 from weather_radar.dpc import DpcClient, make_session
 from weather_radar.frames import FrameStore
+from weather_radar.icon import IconClient
 from weather_radar.ingest import Ingestor
+from weather_radar.temperature import TemperatureIngestor, TemperatureStore
+from weather_radar.terrain import Terrain
 
 
 def main() -> None:
@@ -25,7 +28,21 @@ def main() -> None:
         # The session must be created inside the running event loop.
         session = make_session()
         ingestor = Ingestor(DpcClient(session), store, settings.history, settings.poll_seconds)
-        app = create_app(settings, store, ingestor)
+        temperature = None
+        if settings.temperature:
+            temperature_store = TemperatureStore(settings.data_dir / "temperature")
+            temperature = TemperatureFeature(
+                store=temperature_store,
+                terrain=Terrain(session, settings.data_dir / "terrain"),
+                ingestor=TemperatureIngestor(
+                    IconClient(session),
+                    temperature_store,
+                    settings.temperature_past,
+                    settings.temperature_future,
+                    settings.temperature_poll_seconds,
+                ),
+            )
+        app = create_app(settings, store, ingestor, temperature=temperature)
 
         async def close_session(_: web.Application) -> None:
             await session.close()

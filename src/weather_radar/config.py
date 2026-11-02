@@ -24,6 +24,11 @@ class Settings:
     tile_cache_mib: int = 32
     #: Highest zoom served. The DPC grid is 1 km, about zoom 8; the app overzooms beyond.
     max_zoom: int = 8
+    #: Temperature maps from DWD ICON-EU (downloads about 50 MB every 6 hours).
+    temperature: bool = True
+    temperature_past: timedelta = timedelta(hours=24)
+    temperature_future: timedelta = timedelta(hours=48)
+    temperature_poll_seconds: float = 600.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -36,4 +41,10 @@ class Settings:
             poll_seconds=float(e.get("RADAR_POLL_SECONDS", "30")),
             tile_cache_mib=int(e.get("RADAR_TILE_CACHE_MIB", "32")),
             max_zoom=int(e.get("RADAR_MAX_ZOOM", "8")),
+            temperature=e.get("RADAR_TEMPERATURE", "1") not in {"0", "false", "no", "off"},
+            temperature_past=timedelta(hours=float(e.get("RADAR_TEMPERATURE_PAST_HOURS", "24"))),
+            temperature_future=timedelta(
+                hours=float(e.get("RADAR_TEMPERATURE_FUTURE_HOURS", "48"))
+            ),
+            temperature_poll_seconds=float(e.get("RADAR_TEMPERATURE_POLL_SECONDS", "600")),
         )

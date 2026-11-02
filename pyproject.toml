@@ -1,7 +1,7 @@
 [project]
 name = "weather-radar"
 version = "0.1.0"
-description = "Radar tile server: ingests Italian DPC rain-rate frames and serves map tiles."
+description = "Radar tile server: ingests Italian DPC rain-rate frames and ICON-EU temperature, serves map tiles."
 requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.10",
@@ -10,6 +10,8 @@ dependencies = [
     "Pillow>=10.4",
     # Optical flow and image warping for the short rain forecast (headless: no GUI libraries).
     "opencv-python-headless>=4.10",
+    # Reads DWD's GRIB2 model files (the wheel bundles the ecCodes library).
+    "eccodes>=2.40",
 ]
 
 [project.optional-dependencies]
@@ -43,5 +45,5 @@ strict = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["pyproj", "pyproj.*"]
+module = ["pyproj", "pyproj.*", "eccodes"]
 ignore_missing_imports = true
